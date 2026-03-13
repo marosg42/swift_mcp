@@ -1,0 +1,11 @@
+[project]
+name = "swift-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for OpenStack Swift via S3-compatible API"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "boto3>=1.35.0",
+    "keystoneauth1>=5.0.0",
+    "python-keystoneclient>=5.0.0",
+]
