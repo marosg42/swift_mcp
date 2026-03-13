@@ -16,7 +16,12 @@ import base64
 import json
 import logging
 import os
+import secrets
+import socketserver
 import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler
 from typing import Optional
 
 import boto3
@@ -31,7 +36,45 @@ logging.getLogger("botocore.endpoint").setLevel(logging.DEBUG)
 logging.getLogger("urllib3").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-MAX_OBJECT_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_OBJECT_SIZE = 512 * 1024 * 1024  # 512 MB
+
+# ---------------------------------------------------------------------------
+# Staging HTTP server — serves downloaded objects as raw binary files so the
+# agent can curl them without any base64 / JSON overhead in the MCP context.
+# ---------------------------------------------------------------------------
+
+_STAGE_DIR = tempfile.mkdtemp(prefix="swift_mcp_stage_")
+_STAGE_MAP: dict[str, str] = {}  # token -> local filesystem path
+_FILE_PORT = int(os.environ.get("MCP_FILE_PORT", "8001"))
+
+
+class _StagingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        token = self.path.lstrip("/")
+        local_path = _STAGE_MAP.get(token)
+        if not local_path or not os.path.exists(local_path):
+            self.send_error(404, "Not found")
+            return
+        size = os.path.getsize(local_path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{os.path.basename(local_path)}"',
+        )
+        self.end_headers()
+        with open(local_path, "rb") as f:
+            while chunk := f.read(65536):
+                self.wfile.write(chunk)
+
+    def log_message(self, *args):  # suppress access logs
+        pass
+
+
+_staging_server = socketserver.TCPServer(("0.0.0.0", _FILE_PORT), _StagingHandler)
+_staging_server.allow_reuse_address = True
+threading.Thread(target=_staging_server.serve_forever, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +178,10 @@ mcp = FastMCP(
         "Typical workflows:\n"
         "- Explore: list_containers → list_objects\n"
         "- Inspect without downloading: head_object\n"
-        "- Download files to local disk: list_objects to enumerate keys, then for each "
-        "key call get_object and write the returned content to the local filesystem "
-        "(text files: write 'content' field directly; binary files: base64-decode "
-        "'content_base64' before writing). Files larger than 10 MB cannot be fetched "
-        "and will return an error."
+        "- Read small text files inline: get_object (returns content in JSON)\n"
+        "- Download binary or large files: stage_object → curl the returned URL to disk\n"
+        "  e.g.: stage_object(...) returns {\"url\": \"http://host:8001/<token>\"}, then\n"
+        "  run: curl -fsSL <url> -o /local/path"
     ),
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("MCP_PORT", "8000")),
@@ -231,12 +273,14 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
     """
     Read the content of an object from Swift.
 
-    Objects larger than 10 MB are refused — use head_object to check size first.
+    Objects larger than 512 MB are refused — use head_object to check size first.
     Text content is returned as a string in the "content" field (binary=false).
     Binary content is returned as base64 in the "content_base64" field (binary=true).
 
     To save a file locally: call this tool, then write the content to disk —
     decode base64 first for binary files (e.g. .tar.gz, .gz, images).
+    For files larger than ~10 MB, call this tool from a subagent so the large
+    response does not bloat the main agent context.
 
     Args:
         container: Container (bucket) name.
@@ -249,7 +293,7 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
 
         if size > MAX_OBJECT_SIZE:
             return (
-                f"Error: object is {size:,} bytes — exceeds the 10 MB read limit. "
+                f"Error: object is {size:,} bytes — exceeds the 512 MB read limit. "
                 "Use head_object to inspect its metadata."
             )
 
@@ -283,6 +327,58 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
                 "content_type": content_type,
                 "binary": True,
                 "content_base64": base64.b64encode(body).decode("ascii"),
+            },
+            indent=2,
+        )
+    except ClientError as exc:
+        err = exc.response.get("Error", {})
+        return f"Error: {err.get('Message') or err.get('Code') or str(exc)}"
+
+
+@mcp.tool()
+def stage_object(container: str, key: str) -> str:
+    """
+    Download an object from Swift to a local staging area and return an HTTP URL
+    that the agent can use to fetch the file as raw binary — no base64, no JSON
+    overhead, keeping the MCP context small.
+
+    After calling this tool, download the file with:
+        curl -fsSL <url> -o /local/destination/path
+
+    The staged file is available until the MCP server restarts.
+    Objects larger than 512 MB are refused — use head_object to check size first.
+
+    Args:
+        container: Container (bucket) name.
+        key:       Object key (full path, e.g. "backups/db.tar.gz").
+    """
+    try:
+        head = s3.head_object(Bucket=container, Key=key)
+        size = head.get("ContentLength", 0)
+
+        if size > MAX_OBJECT_SIZE:
+            return (
+                f"Error: object is {size:,} bytes — exceeds the 512 MB limit. "
+                "Use head_object to inspect its metadata."
+            )
+
+        token = secrets.token_hex(16)
+        filename = os.path.basename(key.rstrip("/")) or "object"
+        local_path = os.path.join(_STAGE_DIR, f"{token}_{filename}")
+
+        s3.download_file(container, key, local_path)
+        _STAGE_MAP[token] = local_path
+
+        host_addr = os.environ.get("MCP_HOST_ADDR", "localhost")
+        url = f"http://{host_addr}:{_FILE_PORT}/{token}"
+
+        return json.dumps(
+            {
+                "url": url,
+                "filename": filename,
+                "size_bytes": size,
+                "content_type": head.get("ContentType"),
+                "local_path": local_path,
             },
             indent=2,
         )
