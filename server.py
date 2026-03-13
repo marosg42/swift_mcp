@@ -129,8 +129,17 @@ mcp = FastMCP(
     "swift-mcp",
     instructions=(
         "Read-only access to OpenStack Swift object storage. "
-        "Use list_containers to discover containers, list_objects to browse, "
-        "head_object to inspect metadata, and get_object to read file content."
+        "IMPORTANT: This MCP server is the ONLY way to access Swift — no credentials "
+        "or openrc.sh are available to shell commands or external scripts. "
+        "Always use these tools instead of running boto3/Swift CLI directly.\n\n"
+        "Typical workflows:\n"
+        "- Explore: list_containers → list_objects\n"
+        "- Inspect without downloading: head_object\n"
+        "- Download files to local disk: list_objects to enumerate keys, then for each "
+        "key call get_object and write the returned content to the local filesystem "
+        "(text files: write 'content' field directly; binary files: base64-decode "
+        "'content_base64' before writing). Files larger than 10 MB cannot be fetched "
+        "and will return an error."
     ),
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("MCP_PORT", "8000")),
@@ -223,7 +232,11 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
     Read the content of an object from Swift.
 
     Objects larger than 10 MB are refused — use head_object to check size first.
-    Text content is returned as a string; binary content as base64.
+    Text content is returned as a string in the "content" field (binary=false).
+    Binary content is returned as base64 in the "content_base64" field (binary=true).
+
+    To save a file locally: call this tool, then write the content to disk —
+    decode base64 first for binary files (e.g. .tar.gz, .gz, images).
 
     Args:
         container: Container (bucket) name.
