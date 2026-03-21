@@ -366,7 +366,10 @@ def stage_object(container: str, key: str) -> str:
         filename = os.path.basename(key.rstrip("/")) or "object"
         local_path = os.path.join(_STAGE_DIR, f"{token}_{filename}")
 
-        s3.download_file(container, key, local_path)
+        if size == 0:
+            open(local_path, "wb").close()  # 0-byte object; boto3 download_file fails on empty objects
+        else:
+            s3.download_file(container, key, local_path)
         _STAGE_MAP[token] = local_path
 
         host_addr = os.environ.get("MCP_HOST_ADDR", "localhost")
