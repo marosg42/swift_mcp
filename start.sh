@@ -12,6 +12,7 @@ DEFAULT_OPENRC="/etc/openstack/openrc.sh"
 OPENRC_PATH="${1:-$DEFAULT_OPENRC}"
 export MCP_PORT="${2:-${MCP_PORT:-8000}}"
 export MCP_HOST="${MCP_HOST:-0.0.0.0}"
+# MCP_HOST_ADDR overrides the IP returned in staging URLs (auto-detected if unset)
 
 SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

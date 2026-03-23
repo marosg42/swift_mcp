@@ -1,6 +1,6 @@
 # Swift MCP Server
 
-Read-only MCP server for OpenStack Swift object storage. Runs in an LXD container and exposes Swift containers and objects to AI agents via the Model Context Protocol.
+Read-only MCP server for OpenStack Swift object storage. Runs in an LXD container and exposes the 'solutions-qa' container to AI agents via the Model Context Protocol.
 
 ## Purpose
 
@@ -82,11 +82,38 @@ Add to `.vscode/mcp.json` in your workspace:
 }
 ```
 
+### GitHub Copilot CLI
+
+**Permanent** — add to `~/.copilot/mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "swift-mcp": {
+      "type": "sse",
+      "url": "http://<container-ip>:8000/sse"
+    }
+  }
+}
+```
+
+**Per-session** — pass as a flag:
+
+```bash
+copilot --additional-mcp-config '{"mcpServers":{"swift-mcp":{"type":"sse","url":"http://<container-ip>:8000/sse"}}}'
+```
+
+Or from a file:
+
+```bash
+copilot --additional-mcp-config @/path/to/mcp.json
+```
+
 ## Available tools
 
 | Tool | Description |
 |---|---|
-| `list_containers` | List all Swift containers |
-| `list_objects` | List objects in a container, with optional prefix and delimiter |
-| `get_object` | Read file content (text or binary) |
-| `head_object` | Get file metadata without downloading content |
+| `list_containers` | Return information about the 'solutions-qa' container |
+| `list_objects` | List objects in the 'solutions-qa' container, with optional prefix and delimiter |
+| `get_object` | Read file content (text or binary) from the 'solutions-qa' container |
+| `head_object` | Get file metadata from the 'solutions-qa' container without downloading content |

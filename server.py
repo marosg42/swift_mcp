@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import socketserver
 import sys
 import tempfile
@@ -37,6 +38,7 @@ logging.getLogger("urllib3").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 MAX_OBJECT_SIZE = 512 * 1024 * 1024  # 512 MB
+CONTAINER_NAME = "solutions-qa"  # Hardcoded container to serve
 
 # ---------------------------------------------------------------------------
 # Staging HTTP server — serves downloaded objects as raw binary files so the
@@ -168,6 +170,16 @@ except Exception as _err:
 # MCP server
 # ---------------------------------------------------------------------------
 
+def _get_host_ip() -> str:
+    """Return the primary outbound IP address of this host."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 mcp = FastMCP(
     "swift-mcp",
     instructions=(
@@ -176,7 +188,7 @@ mcp = FastMCP(
         "or openrc.sh are available to shell commands or external scripts. "
         "Always use these tools instead of running boto3/Swift CLI directly.\n\n"
         "Typical workflows:\n"
-        "- Explore: list_containers → list_objects\n"
+        "- Explore: list_objects (serves only 'solutions-qa' container)\n"
         "- Inspect without downloading: head_object\n"
         "- Read small text files inline: get_object (returns content in JSON)\n"
         "- Download binary or large files: stage_object → curl the returned URL to disk\n"
@@ -190,14 +202,12 @@ mcp = FastMCP(
 
 @mcp.tool()
 def list_containers() -> str:
-    """List all Swift containers (S3 buckets) visible to the configured credentials."""
+    """Return information about the single hardcoded container 'solutions-qa'."""
     try:
-        response = s3.list_buckets()
-        buckets = response.get("Buckets", [])
-        if not buckets:
-            return "No containers found."
+        # Check if the container exists by attempting to list it
+        s3.head_bucket(Bucket=CONTAINER_NAME)
         return json.dumps(
-            [{"name": b["Name"], "created": b["CreationDate"].isoformat()} for b in buckets],
+            {"name": CONTAINER_NAME, "note": "This MCP server only serves the solutions-qa container"},
             indent=2,
         )
     except ClientError as exc:
@@ -207,16 +217,14 @@ def list_containers() -> str:
 
 @mcp.tool()
 def list_objects(
-    container: str,
     prefix: str = "",
     delimiter: str = "",
     max_keys: int = 1000,
 ) -> str:
     """
-    List objects inside a Swift container.
+    List objects inside the 'solutions-qa' container.
 
     Args:
-        container: Container (bucket) name.
         prefix:    Return only objects whose key starts with this string,
                    e.g. "logs/2024/" to navigate into a subdirectory.
         delimiter: Group keys by this character. Use "/" for a directory-style
@@ -227,7 +235,7 @@ def list_objects(
     try:
         objects = []
         common_prefixes = []
-        kwargs: dict = {"Bucket": container, "MaxKeys": 1000}
+        kwargs: dict = {"Bucket": CONTAINER_NAME, "MaxKeys": 1000}
         if prefix:
             kwargs["Prefix"] = prefix
         if delimiter:
@@ -246,7 +254,7 @@ def list_objects(
         objects = objects[:max_keys]
         return json.dumps(
             {
-                "container": container,
+                "container": CONTAINER_NAME,
                 "prefix": prefix,
                 "truncated": len(objects) == max_keys and response.get("IsTruncated", False),
                 "count": len(objects),
@@ -269,9 +277,9 @@ def list_objects(
 
 
 @mcp.tool()
-def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
+def get_object(key: str, encoding: str = "utf-8") -> str:
     """
-    Read the content of an object from Swift.
+    Read the content of an object from the 'solutions-qa' container.
 
     Objects larger than 512 MB are refused — use head_object to check size first.
     Text content is returned as a string in the "content" field (binary=false).
@@ -283,12 +291,11 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
     response does not bloat the main agent context.
 
     Args:
-        container: Container (bucket) name.
         key:       Object key (full path, e.g. "logs/2024/app.log").
         encoding:  Text encoding to attempt (default "utf-8").
     """
     try:
-        head = s3.head_object(Bucket=container, Key=key)
+        head = s3.head_object(Bucket=CONTAINER_NAME, Key=key)
         size = head.get("ContentLength", 0)
 
         if size > MAX_OBJECT_SIZE:
@@ -297,7 +304,7 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
                 "Use head_object to inspect its metadata."
             )
 
-        response = s3.get_object(Bucket=container, Key=key)
+        response = s3.get_object(Bucket=CONTAINER_NAME, Key=key)
         body = response["Body"].read()
         content_type = response.get("ContentType", "")
 
@@ -306,7 +313,7 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
             try:
                 return json.dumps(
                     {
-                        "container": container,
+                        "container": CONTAINER_NAME,
                         "key": key,
                         "size_bytes": size,
                         "content_type": content_type,
@@ -321,7 +328,7 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
 
         return json.dumps(
             {
-                "container": container,
+                "container": CONTAINER_NAME,
                 "key": key,
                 "size_bytes": size,
                 "content_type": content_type,
@@ -336,11 +343,11 @@ def get_object(container: str, key: str, encoding: str = "utf-8") -> str:
 
 
 @mcp.tool()
-def stage_object(container: str, key: str) -> str:
+def stage_object(key: str) -> str:
     """
-    Download an object from Swift to a local staging area and return an HTTP URL
-    that the agent can use to fetch the file as raw binary — no base64, no JSON
-    overhead, keeping the MCP context small.
+    Download an object from the 'solutions-qa' container to a local staging area
+    and return an HTTP URL that the agent can use to fetch the file as raw binary —
+    no base64, no JSON overhead, keeping the MCP context small.
 
     After calling this tool, download the file with:
         curl -fsSL <url> -o /local/destination/path
@@ -349,11 +356,10 @@ def stage_object(container: str, key: str) -> str:
     Objects larger than 512 MB are refused — use head_object to check size first.
 
     Args:
-        container: Container (bucket) name.
         key:       Object key (full path, e.g. "backups/db.tar.gz").
     """
     try:
-        head = s3.head_object(Bucket=container, Key=key)
+        head = s3.head_object(Bucket=CONTAINER_NAME, Key=key)
         size = head.get("ContentLength", 0)
 
         if size > MAX_OBJECT_SIZE:
@@ -369,10 +375,10 @@ def stage_object(container: str, key: str) -> str:
         if size == 0:
             open(local_path, "wb").close()  # 0-byte object; boto3 download_file fails on empty objects
         else:
-            s3.download_file(container, key, local_path)
+            s3.download_file(CONTAINER_NAME, key, local_path)
         _STAGE_MAP[token] = local_path
 
-        host_addr = os.environ.get("MCP_HOST_ADDR", "localhost")
+        host_addr = os.environ.get("MCP_HOST_ADDR") or _get_host_ip()
         url = f"http://{host_addr}:{_FILE_PORT}/{token}"
 
         return json.dumps(
@@ -391,19 +397,18 @@ def stage_object(container: str, key: str) -> str:
 
 
 @mcp.tool()
-def head_object(container: str, key: str) -> str:
+def head_object(key: str) -> str:
     """
-    Return metadata for an object without downloading its content.
+    Return metadata for an object in the 'solutions-qa' container without downloading its content.
 
     Args:
-        container: Container (bucket) name.
         key:       Object key (full path).
     """
     try:
-        r = s3.head_object(Bucket=container, Key=key)
+        r = s3.head_object(Bucket=CONTAINER_NAME, Key=key)
         return json.dumps(
             {
-                "container": container,
+                "container": CONTAINER_NAME,
                 "key": key,
                 "size_bytes": r.get("ContentLength"),
                 "content_type": r.get("ContentType"),
