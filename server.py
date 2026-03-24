@@ -446,7 +446,7 @@ def stage_uuid_bundle(uuid: str) -> str:
         kwargs: dict = {"Bucket": CONTAINER_NAME, "Prefix": uuid}
         while True:
             response = s3.list_objects_v2(**kwargs)
-            objects.extend({"key": obj["Key"], "size": obj["Size"]} for obj in response.get("Contents", []))
+        objects.extend({"key": obj["Key"], "size": obj["Size"]} for obj in response.get("Contents", []) if not obj["Key"].endswith(".img"))
             if not response.get("IsTruncated"):
                 break
             kwargs["ContinuationToken"] = response["NextContinuationToken"]
