@@ -20,8 +20,10 @@ import secrets
 import socket
 import socketserver
 import sys
+import tarfile
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from typing import Optional
 
@@ -46,8 +48,24 @@ CONTAINER_NAME = "solutions-qa"  # Hardcoded container to serve
 # ---------------------------------------------------------------------------
 
 _STAGE_DIR = tempfile.mkdtemp(prefix="swift_mcp_stage_")
-_STAGE_MAP: dict[str, str] = {}  # token -> local filesystem path
+_STAGE_MAP: dict[str, str] = {}   # token -> local filesystem path
+_STAGE_TIME: dict[str, float] = {}  # token -> creation timestamp
 _FILE_PORT = int(os.environ.get("MCP_FILE_PORT", "8001"))
+_STAGE_TTL = 24 * 60 * 60  # 24 hours
+
+
+def _reap_staged_files() -> None:
+    """Delete staged files older than 24 hours. Called on each new staging request."""
+    cutoff = time.monotonic() - _STAGE_TTL
+    for token in list(_STAGE_TIME):
+        if _STAGE_TIME.get(token, float("inf")) < cutoff:
+            local_path = _STAGE_MAP.pop(token, None)
+            _STAGE_TIME.pop(token, None)
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.unlink(local_path)
+                except OSError:
+                    pass
 
 
 class _StagingHandler(BaseHTTPRequestHandler):
@@ -193,7 +211,10 @@ mcp = FastMCP(
         "- Read small text files inline: get_object (returns content in JSON)\n"
         "- Download binary or large files: stage_object → curl the returned URL to disk\n"
         "  e.g.: stage_object(...) returns {\"url\": \"http://host:8001/<token>\"}, then\n"
-        "  run: curl -fsSL <url> -o /local/path"
+        "  run: curl -fsSL <url> -o /local/path\n"
+        "- Download all files for a UUID as a single archive: stage_uuid_bundle → curl the returned URL\n"
+        "  e.g.: stage_uuid_bundle(uuid=...) returns {\"url\": \"...\"}, then\n"
+        "  run: curl -fsSL <url> -o <uuid>.tgz && tar xzf <uuid>.tgz"
     ),
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
     port=int(os.environ.get("MCP_PORT", "8000")),
@@ -359,6 +380,7 @@ def stage_object(key: str) -> str:
         key:       Object key (full path, e.g. "backups/db.tar.gz").
     """
     try:
+        _reap_staged_files()
         head = s3.head_object(Bucket=CONTAINER_NAME, Key=key)
         size = head.get("ContentLength", 0)
 
@@ -377,6 +399,7 @@ def stage_object(key: str) -> str:
         else:
             s3.download_file(CONTAINER_NAME, key, local_path)
         _STAGE_MAP[token] = local_path
+        _STAGE_TIME[token] = time.monotonic()
 
         host_addr = os.environ.get("MCP_HOST_ADDR") or _get_host_ip()
         url = f"http://{host_addr}:{_FILE_PORT}/{token}"
@@ -388,6 +411,83 @@ def stage_object(key: str) -> str:
                 "size_bytes": size,
                 "content_type": head.get("ContentType"),
                 "local_path": local_path,
+            },
+            indent=2,
+        )
+    except ClientError as exc:
+        err = exc.response.get("Error", {})
+        return f"Error: {err.get('Message') or err.get('Code') or str(exc)}"
+
+
+@mcp.tool()
+def stage_uuid_bundle(uuid: str) -> str:
+    """
+    Download all objects whose key starts with the given UUID, pack them into
+    a tar.gz archive named '<uuid>.tgz', stage it, and return an HTTP URL for
+    download — identical transport to stage_object.
+
+    The archive preserves the original key structure under a top-level directory
+    named after the UUID, so:
+        tar xzf <uuid>.tgz
+    extracts into ./<uuid>/...
+
+    After calling this tool, download the archive with:
+        curl -fsSL <url> -o <uuid>.tgz
+
+    Args:
+        uuid:  Prefix to match (e.g. "a1b2c3d4-..."). All objects whose key
+               starts with this string are included.
+    """
+    try:
+        _reap_staged_files()
+
+        # Collect all matching keys with their sizes
+        objects = []
+        kwargs: dict = {"Bucket": CONTAINER_NAME, "Prefix": uuid}
+        while True:
+            response = s3.list_objects_v2(**kwargs)
+            objects.extend({"key": obj["Key"], "size": obj["Size"]} for obj in response.get("Contents", []))
+            if not response.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = response["NextContinuationToken"]
+
+        if not objects:
+            return f"Error: no objects found with prefix '{uuid}'"
+
+        # Download into a temp directory, preserving key paths under uuid/
+        with tempfile.TemporaryDirectory(prefix="swift_mcp_bundle_") as work_dir:
+            uuid_dir = os.path.join(work_dir, uuid)
+            for obj in objects:
+                key, size = obj["key"], obj["size"]
+                # Strip the uuid prefix so paths inside the archive are relative
+                rel = key[len(uuid):].lstrip("/")
+                dest = os.path.join(uuid_dir, rel) if rel else os.path.join(uuid_dir, os.path.basename(key))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                if size == 0:
+                    open(dest, "wb").close()  # boto3 download_file fails on empty objects
+                else:
+                    s3.download_file(CONTAINER_NAME, key, dest)
+
+            # Build the tgz in the staging directory
+            tgz_name = f"{uuid}.tgz"
+            tgz_path = os.path.join(_STAGE_DIR, tgz_name)
+            with tarfile.open(tgz_path, "w:gz") as tar:
+                tar.add(uuid_dir, arcname=uuid)
+
+        token = secrets.token_hex(16)
+        _STAGE_MAP[token] = tgz_path
+        _STAGE_TIME[token] = time.monotonic()
+
+        host_addr = os.environ.get("MCP_HOST_ADDR") or _get_host_ip()
+        url = f"http://{host_addr}:{_FILE_PORT}/{token}"
+        size = os.path.getsize(tgz_path)
+
+        return json.dumps(
+            {
+                "url": url,
+                "filename": tgz_name,
+                "size_bytes": size,
+                "object_count": len(objects),
             },
             indent=2,
         )

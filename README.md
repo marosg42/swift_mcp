@@ -117,3 +117,5 @@ copilot --additional-mcp-config @/path/to/mcp.json
 | `list_objects` | List objects in the 'solutions-qa' container, with optional prefix and delimiter |
 | `get_object` | Read file content (text or binary) from the 'solutions-qa' container |
 | `head_object` | Get file metadata from the 'solutions-qa' container without downloading content |
+| `stage_object` | Download an object to a staging area and return an HTTP URL for `curl` download |
+| `stage_uuid_bundle` | Download all objects matching a UUID prefix, pack them into `<uuid>.tgz`, and return an HTTP URL for `curl` download |
