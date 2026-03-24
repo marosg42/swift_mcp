@@ -48,7 +48,7 @@ CONTAINER_NAME = "solutions-qa"  # Hardcoded container to serve
 # ---------------------------------------------------------------------------
 
 _STAGE_DIR = tempfile.mkdtemp(prefix="swift_mcp_stage_")
-_STAGE_MAP: dict[str, str] = {}   # token -> local filesystem path
+_STAGE_MAP: dict[str, str] = {}  # token -> local filesystem path
 _STAGE_TIME: dict[str, float] = {}  # token -> creation timestamp
 _FILE_PORT = int(os.environ.get("MCP_FILE_PORT", "8001"))
 _STAGE_TTL = 24 * 60 * 60  # 24 hours
@@ -101,22 +101,25 @@ threading.Thread(target=_staging_server.serve_forever, daemon=True).start()
 # Startup: authenticate with Keystone and build boto3 client
 # ---------------------------------------------------------------------------
 
+
 def _require_env(key: str) -> str:
     val = os.environ.get(key, "").strip()
     if not val:
-        raise RuntimeError(f"Required environment variable '{key}' is not set in openrc.sh")
+        raise RuntimeError(
+            f"Required environment variable '{key}' is not set in openrc.sh"
+        )
     return val
 
 
 def _build_s3_client():
-    auth_url    = _require_env("OS_AUTH_URL")
-    username    = _require_env("OS_USERNAME")
-    password    = _require_env("OS_PASSWORD")
-    project     = _require_env("OS_PROJECT_NAME")
+    auth_url = _require_env("OS_AUTH_URL")
+    username = _require_env("OS_USERNAME")
+    password = _require_env("OS_PASSWORD")
+    project = _require_env("OS_PROJECT_NAME")
     user_domain = os.environ.get("OS_USER_DOMAIN_NAME", "Default")
     proj_domain = os.environ.get("OS_PROJECT_DOMAIN_NAME", "Default")
-    region      = os.environ.get("OS_REGION_NAME") or None
-    interface   = os.environ.get("OS_INTERFACE", "public")
+    region = os.environ.get("OS_REGION_NAME") or None
+    interface = os.environ.get("OS_INTERFACE", "public")
 
     loader = loading.get_plugin_loader("password")
     auth = loader.load_from_options(
@@ -188,6 +191,7 @@ except Exception as _err:
 # MCP server
 # ---------------------------------------------------------------------------
 
+
 def _get_host_ip() -> str:
     """Return the primary outbound IP address of this host."""
     try:
@@ -210,10 +214,10 @@ mcp = FastMCP(
         "- Inspect without downloading: head_object\n"
         "- Read small text files inline: get_object (returns content in JSON)\n"
         "- Download binary or large files: stage_object → curl the returned URL to disk\n"
-        "  e.g.: stage_object(...) returns {\"url\": \"http://host:8001/<token>\"}, then\n"
+        '  e.g.: stage_object(...) returns {"url": "http://host:8001/<token>"}, then\n'
         "  run: curl -fsSL <url> -o /local/path\n"
         "- Download all files for a UUID as a single archive: stage_uuid_bundle → curl the returned URL\n"
-        "  e.g.: stage_uuid_bundle(uuid=...) returns {\"url\": \"...\"}, then\n"
+        '  e.g.: stage_uuid_bundle(uuid=...) returns {"url": "..."}, then\n'
         "  run: curl -fsSL <url> -o <uuid>.tgz && tar xzf <uuid>.tgz"
     ),
     host=os.environ.get("MCP_HOST", "0.0.0.0"),
@@ -228,7 +232,10 @@ def list_containers() -> str:
         # Check if the container exists by attempting to list it
         s3.head_bucket(Bucket=CONTAINER_NAME)
         return json.dumps(
-            {"name": CONTAINER_NAME, "note": "This MCP server only serves the solutions-qa container"},
+            {
+                "name": CONTAINER_NAME,
+                "note": "This MCP server only serves the solutions-qa container",
+            },
             indent=2,
         )
     except ClientError as exc:
@@ -277,7 +284,8 @@ def list_objects(
             {
                 "container": CONTAINER_NAME,
                 "prefix": prefix,
-                "truncated": len(objects) == max_keys and response.get("IsTruncated", False),
+                "truncated": len(objects) == max_keys
+                and response.get("IsTruncated", False),
                 "count": len(objects),
                 "objects": [
                     {
@@ -330,7 +338,11 @@ def get_object(key: str, encoding: str = "utf-8") -> str:
         content_type = response.get("ContentType", "")
 
         text_types = ("text/", "json", "xml", "yaml", "javascript", "csv")
-        if any(t in content_type for t in text_types) or not content_type or content_type == "binary/octet-stream":
+        if (
+            any(t in content_type for t in text_types)
+            or not content_type
+            or content_type == "binary/octet-stream"
+        ):
             try:
                 return json.dumps(
                     {
@@ -395,7 +407,9 @@ def stage_object(key: str) -> str:
         local_path = os.path.join(_STAGE_DIR, f"{token}_{filename}")
 
         if size == 0:
-            open(local_path, "wb").close()  # 0-byte object; boto3 download_file fails on empty objects
+            open(
+                local_path, "wb"
+            ).close()  # 0-byte object; boto3 download_file fails on empty objects
         else:
             s3.download_file(CONTAINER_NAME, key, local_path)
         _STAGE_MAP[token] = local_path
@@ -446,7 +460,11 @@ def stage_uuid_bundle(uuid: str) -> str:
         kwargs: dict = {"Bucket": CONTAINER_NAME, "Prefix": uuid}
         while True:
             response = s3.list_objects_v2(**kwargs)
-        objects.extend({"key": obj["Key"], "size": obj["Size"]} for obj in response.get("Contents", []) if not obj["Key"].endswith(".img"))
+            objects.extend(
+                {"key": obj["Key"], "size": obj["Size"]}
+                for obj in response.get("Contents", [])
+                if not obj["Key"].endswith(".img")
+            )
             if not response.get("IsTruncated"):
                 break
             kwargs["ContinuationToken"] = response["NextContinuationToken"]
@@ -460,11 +478,17 @@ def stage_uuid_bundle(uuid: str) -> str:
             for obj in objects:
                 key, size = obj["key"], obj["size"]
                 # Strip the uuid prefix so paths inside the archive are relative
-                rel = key[len(uuid):].lstrip("/")
-                dest = os.path.join(uuid_dir, rel) if rel else os.path.join(uuid_dir, os.path.basename(key))
+                rel = key[len(uuid) :].lstrip("/")
+                dest = (
+                    os.path.join(uuid_dir, rel)
+                    if rel
+                    else os.path.join(uuid_dir, os.path.basename(key))
+                )
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 if size == 0:
-                    open(dest, "wb").close()  # boto3 download_file fails on empty objects
+                    open(
+                        dest, "wb"
+                    ).close()  # boto3 download_file fails on empty objects
                 else:
                     s3.download_file(CONTAINER_NAME, key, dest)
 
