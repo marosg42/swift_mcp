@@ -35,8 +35,6 @@ from keystoneclient.v3 import client as keystone_client
 from mcp.server.fastmcp import FastMCP
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
-logging.getLogger("botocore.endpoint").setLevel(logging.DEBUG)
-logging.getLogger("urllib3").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 MAX_OBJECT_SIZE = 512 * 1024 * 1024  # 512 MB
@@ -121,6 +119,15 @@ def _build_s3_client():
     region = os.environ.get("OS_REGION_NAME") or None
     interface = os.environ.get("OS_INTERFACE", "public")
 
+    cacert = os.environ.get("OS_CACERT") or None
+    insecure = os.environ.get("OS_INSECURE", "").lower() in ("1", "true", "yes")
+    # Fall back to the system CA bundle so internal/private CAs are trusted even
+    # when certifi ships its own bundle (e.g. installed via pip/uv rather than apt).
+    _system_ca = "/etc/ssl/certs/ca-certificates.crt"
+    if not cacert and not insecure and os.path.exists(_system_ca):
+        cacert = _system_ca
+    verify: bool | str = False if insecure else (cacert or True)
+
     loader = loading.get_plugin_loader("password")
     auth = loader.load_from_options(
         auth_url=auth_url,
@@ -130,7 +137,7 @@ def _build_s3_client():
         user_domain_name=user_domain,
         project_domain_name=proj_domain,
     )
-    sess = ks_session.Session(auth=auth)
+    sess = ks_session.Session(auth=auth, verify=verify)
 
     # -- S3 endpoint from service catalog ------------------------------------
     endpoint: Optional[str] = None
@@ -172,6 +179,7 @@ def _build_s3_client():
         aws_access_key_id=cred.access,
         aws_secret_access_key=cred.secret,
         region_name=region or "regionOne",
+        verify=verify,
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
@@ -185,6 +193,20 @@ try:
 except Exception as _err:
     print(f"ERROR: {_err}", file=sys.stderr)
     sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Startup connectivity check — list containers and confirm Swift is reachable
+# ---------------------------------------------------------------------------
+try:
+    _buckets_resp = s3.list_buckets()
+    _containers = [b["Name"] for b in _buckets_resp.get("Buckets", [])]
+    print("Swift connectivity OK — containers found:", file=sys.stderr)
+    for _c in _containers:
+        print(f"  - {_c}", file=sys.stderr)
+    if not _containers:
+        print("  (no containers found)", file=sys.stderr)
+except Exception as _err:
+    print(f"WARNING: Swift connectivity check failed: {_err}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
