@@ -2,11 +2,15 @@
 # lxd_setup.sh — Create and configure the LXD container for the Swift MCP server.
 #
 # Usage:
-#   ./lxd_setup.sh [CONTAINER_NAME] [OPENRC_HOST_PATH]
+#   ./lxd_setup.sh [--expose] [CONTAINER_NAME] [OPENRC_HOST_PATH]
+#
+# Options:
+#   --expose         Forward host port → container port so the server is
+#                    reachable from other machines on the network.
 #
 # Defaults:
-#   CONTAINER_NAME   = swift-mcp
-#   OPENRC_HOST_PATH = /etc/openstack/openrc.sh  (path on the HOST)
+#   CONTAINER_NAME   = swift-mcp-server
+#   OPENRC_HOST_PATH = ~/external_env_files/ps5_swift  (path on the HOST)
 #
 # The openrc.sh is bind-mounted read-only into the container at
 #   /etc/openstack/openrc.sh
@@ -14,8 +18,17 @@
 
 set -euo pipefail
 
-CONTAINER="${1:-swift-mcp-server}"
-OPENRC_HOST="${2:-$HOME/external_env_files/ps5_swift}"
+EXPOSE=false
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --expose) EXPOSE=true ;;
+        *)        POSITIONAL+=("$arg") ;;
+    esac
+done
+
+CONTAINER="${POSITIONAL[0]:-swift-mcp-server}"
+OPENRC_HOST="${POSITIONAL[1]:-$HOME/external_env_files/ps5_swift}"
 INSTALL_DIR="/opt/swift-mcp"
 
 # ── Preflight ────────────────────────────────────────────────────────────────
@@ -69,21 +82,47 @@ lxc exec "$CONTAINER" -- chmod +x "$INSTALL_DIR/start.sh"
 echo "==> Installing Python dependencies (uv sync)..."
 lxc exec "$CONTAINER" --cwd "$INSTALL_DIR" -- uv sync
 
+# ── Expose container ports on host ───────────────────────────────────────────
+HOST_PORT="${MCP_PORT:-8000}"
+FILE_PORT="${MCP_FILE_PORT:-8001}"
+if $EXPOSE; then
+    echo "==> Forwarding host port $HOST_PORT → container port $HOST_PORT (MCP/SSE)..."
+    lxc config device add "$CONTAINER" mcp-proxy proxy \
+        listen=tcp:0.0.0.0:"$HOST_PORT" \
+        connect=tcp:127.0.0.1:"$HOST_PORT" 2>/dev/null || \
+        echo "    Proxy device 'mcp-proxy' already configured — skipping."
+
+    echo "==> Forwarding host port $FILE_PORT → container port $FILE_PORT (staging downloads)..."
+    lxc config device add "$CONTAINER" mcp-file-proxy proxy \
+        listen=tcp:0.0.0.0:"$FILE_PORT" \
+        connect=tcp:127.0.0.1:"$FILE_PORT" 2>/dev/null || \
+        echo "    Proxy device 'mcp-file-proxy' already configured — skipping."
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────────────
+HOST_IP=$(hostname -I | awk '{print $1}')
 CONTAINER_IP=$(lxc list "$CONTAINER" -c 4 --format csv | cut -d' ' -f1)
 
 cat <<EOF
 
 ==> Done. Container '$CONTAINER' is ready.
 
-Start the MCP server (runs in foreground, listens on port 8000):
+Start the MCP server (runs in foreground, listens on port $HOST_PORT):
   lxc exec $CONTAINER -- $INSTALL_DIR/start.sh
 
 The server will be reachable at:
-  http://${CONTAINER_IP:-<container-ip>}:8000/sse
+EOF
 
-To use a different port:
-  lxc exec $CONTAINER -- bash -c 'MCP_PORT=9000 $INSTALL_DIR/start.sh'
+if $EXPOSE; then
+    echo "  http://${HOST_IP:-<host-ip>}:$HOST_PORT/sse  (via host proxy)"
+else
+    echo "  http://${CONTAINER_IP:-<container-ip>}:$HOST_PORT/sse  (container-local only)"
+    echo ""
+    echo "  To expose on the network, re-run with --expose:"
+    echo "    ./lxd_setup.sh --expose $CONTAINER $OPENRC_HOST"
+fi
+
+cat <<EOF
 
 To open a shell for debugging:
   lxc exec $CONTAINER -- bash
